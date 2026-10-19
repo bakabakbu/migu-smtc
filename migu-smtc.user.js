@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         咪咕音乐 SMTC 修复（Lyricify Fusion / 系统音量栏）
 // @namespace    https://github.com/bakabakbu/migu-smtc
-// @version      0.4.2
+// @version      0.6.0
 // @description  为咪咕音乐网页版补齐 Media Session 元数据，使其接入 Windows SMTC
 // @author       bakabakbu
 // @license      MIT
@@ -10,8 +10,11 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_getValue
 // @grant        GM_setValue
-// @run-at       document-idle
-// @inject-into  page
+// @grant        GM_xmlhttpRequest
+// @connect      d.musicapp.migu.cn
+// @connect      *.migu.cn
+// @run-at       document-start
+// @inject-into  content
 // @noframes
 // @icon         https://music.migu.cn/favicon.ico
 // @updateURL    https://raw.githubusercontent.com/bakabakbu/migu-smtc/main/migu-smtc.user.js
@@ -53,19 +56,28 @@
   // ③ guard · 门卫
   let DEBUG = false; // 日常静默；配置面板里的"调试日志"开关可临时打开
 
-  if (window.top !== window.self) {
+  // 沙箱模式注入：对网页动手必须走 unsafeWindow 这张通行证
+  const UW = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+  function session() {
+    return UW.navigator.mediaSession;
+  }
+  function newMeta(payload) {
+    return new UW.MediaMetadata(payload);
+  }
+
+  if (UW.top !== UW.self) {
     return;
   }
-  if (!('mediaSession' in navigator)) {
+  if (!('mediaSession' in UW.navigator)) {
     if (DEBUG) {
-      console.warn('[咪咕SMTC] 当前浏览器不支持 mediaSession，脚本退出');
+      log('[咪咕SMTC] 当前浏览器不支持 mediaSession，脚本退出');
     }
     return;
   }
-  if (window.__MIGU_SMTC_LOADED__) {
+  if (UW.__MIGU_SMTC_LOADED__) {
     return;
   }
-  window.__MIGU_SMTC_LOADED__ = true;
+  UW.__MIGU_SMTC_LOADED__ = true;
 
   // ② config · 配置（咪咕改版后改这里的门牌号即可）
   const SEL = {
@@ -77,6 +89,7 @@
   };
   const THROTTLE_MS = 300;
   const POLL_MS = 2000;
+  const ALBUM = '咪咕音乐'; // 网页上看不到专辑名，统一用固定值占位
 
   // 读取配置面板的值；任何失败都保留内置默认值，绝不中断脚本
   function readValue(key) {
@@ -136,7 +149,9 @@
       }
       const coverEl = document.querySelector(SEL.cover);
       if (coverEl) {
-        info.cover = coverEl.currentSrc || coverEl.src || '';
+        const src = coverEl.currentSrc || coverEl.src || '';
+        // 咪咕换歌瞬间会出现 base64 占位灰图，这种不能当封面报
+        info.cover = src.indexOf('data:') === 0 ? '' : src;
       }
       // 咪咕无 audio 元素，靠播放按钮 title 反推：显示"暂停"= 正在播
       const buttons = document.querySelectorAll(SEL.button);
@@ -153,40 +168,181 @@
     return info;
   }
 
+  // ⑤b coverConverter · 封面转内置图片（data: 地址）
+  // Chromium 在窗口最小化时不给系统卡片下载封面图，恢复窗口才更新；
+  // 转成 data: 地址后图片数据直接内嵌，无需下载，最小化时也能实时更新
+  const coverCache = new Map();
+
+  function toCoverDataUrl(url) {
+    return new Promise((resolve) => {
+      if (!url) {
+        resolve(null);
+        return;
+      }
+      if (coverCache.has(url)) {
+        resolve(coverCache.get(url));
+        return;
+      }
+
+      // 拿到图片数据后，缩到 256px 再转 JPEG 内置格式（体积小、系统卡片够用）
+      function bitmapToDataUrl(blob) {
+        return new Promise((res) => {
+          try {
+            createImageBitmap(blob).then((bmp) => {
+              try {
+                const scale = Math.min(256 / bmp.width, 256 / bmp.height, 1);
+                const canvas = document.createElement('canvas');
+                canvas.width = Math.max(1, Math.round(bmp.width * scale));
+                canvas.height = Math.max(1, Math.round(bmp.height * scale));
+                canvas.getContext('2d').drawImage(bmp, 0, 0, canvas.width, canvas.height);
+                res(canvas.toDataURL('image/jpeg', 0.85));
+              } catch (err) {
+                res(null);
+              }
+            }).catch(() => res(null));
+          } catch (err) {
+            res(null);
+          }
+        });
+      }
+
+      // 优先走脚本猫的特权下载（不受跨域限制）
+      if (typeof GM_xmlhttpRequest === 'function') {
+        try {
+          GM_xmlhttpRequest({
+            method: 'GET',
+            url: url,
+            responseType: 'blob',
+            timeout: 8000,
+            onload: (res) => {
+              if (!res.response) {
+                resolve(null);
+                return;
+              }
+              bitmapToDataUrl(res.response).then((data) => {
+                if (data && coverCache.size > 20) {
+                  coverCache.delete(coverCache.keys().next().value);
+                }
+                if (data) {
+                  coverCache.set(url, data);
+                }
+                resolve(data);
+              });
+            },
+            onerror: () => resolve(null),
+            ontimeout: () => resolve(null)
+          });
+          return;
+        } catch (err) {
+          /* 掉到下面的普通方案 */
+        }
+      }
+
+      // 备用：普通图片加载（服务器允许跨域时才行）
+      try {
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        img.onload = () => {
+          try {
+            const scale = Math.min(256 / (img.naturalWidth || 256), 256 / (img.naturalHeight || 256), 1);
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.max(1, Math.round((img.naturalWidth || 256) * scale));
+            canvas.height = Math.max(1, Math.round((img.naturalHeight || 256) * scale));
+            canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+            const data = canvas.toDataURL('image/jpeg', 0.85);
+            coverCache.set(url, data);
+            resolve(data);
+          } catch (err) {
+            resolve(null);
+          }
+        };
+        img.onerror = () => resolve(null);
+        img.src = url;
+      } catch (err) {
+        resolve(null);
+      }
+    });
+  }
+
+  function pushMetadata(title, artist, cover, coverData) {
+    let artwork = [];
+    if (cover) {
+      artwork = [{
+        src: coverData || freshCoverUrl(cover),
+        sizes: 'any',
+        type: coverData ? 'image/jpeg' : 'image/webp'
+      }];
+    }
+    session().metadata = newMeta({
+      title: title,
+      artist: artist,
+      album: ALBUM,
+      artwork: artwork
+    });
+  }
+
   // ⑥ writer · 上报
   let lastFingerprint = '';
-  let current = { title: '', artist: '', album: '', cover: '' };
+  let current = { title: '', artist: '', cover: '' };
 
-  function writeMeta(info, force) {
+  // 给封面地址加一次性编号：地址每次都不同，逼浏览器重新下载、刷新系统卡片封面
+  function freshCoverUrl(cover) {
+    if (!cover) {
+      return cover;
+    }
+    const stamp = 'smtc=' + Date.now();
+    return cover + (cover.indexOf('?') >= 0 ? '&' : '?') + stamp;
+  }
+
+  // 封面内置转换失败时的兜底：150ms 后换全新地址重写一次，触发系统重绘
+  let refreshTimer = null;
+  function scheduleCoverRefresh(title, artist, cover) {
+    if (refreshTimer) {
+      clearTimeout(refreshTimer);
+    }
+    refreshTimer = setTimeout(() => {
+      refreshTimer = null;
+      try {
+        if (current.cover === cover) {
+          pushMetadata(title, artist, cover, null);
+        }
+      } catch (err) {
+        log('强制刷新失败', err);
+      }
+    }, 150);
+  }
+
+  function writeMeta(info) {
     try {
       const title = info.title || current.title;
       const artist = info.artist || current.artist;
-      const album = info.album || current.album;
       const cover = info.cover || current.cover;
       if (!title) {
         return;
       }
       const fingerprint = [title, artist, cover].join('|');
       if (fingerprint === lastFingerprint) {
-        // 同一首歌不再重写，除非这次带来了之前缺的专辑名
-        if (force && album && !current.album) {
-          current.album = album;
-          navigator.mediaSession.metadata = new MediaMetadata({
-            title: title, artist: artist, album: album,
-            artwork: cover ? [{ src: cover, sizes: 'any', type: 'image/webp' }] : []
-          });
-        }
         return;
       }
       lastFingerprint = fingerprint;
-      current = { title: title, artist: artist, album: album, cover: cover };
-      navigator.mediaSession.metadata = new MediaMetadata({
-        title: title,
-        artist: artist,
-        album: album || '咪咕音乐',
-        artwork: cover ? [{ src: cover, sizes: 'any', type: 'image/webp' }] : []
-      });
-      log('已上报：', title, '-', artist);
+      current = { title: title, artist: artist, cover: cover };
+      pushMetadata(title, artist, cover, null);
+      log('已上报：', title, '-', artist, '| 封面：', cover);
+      if (cover) {
+        // 转成内置图片后重报：图片数据随上报一起送达，不依赖浏览器再去下载
+        toCoverDataUrl(cover).then((data) => {
+          try {
+            if (data && current.cover === cover && current.title === title) {
+              pushMetadata(title, artist, cover, data);
+              log('封面已内置');
+            } else if (!data) {
+              scheduleCoverRefresh(title, artist, cover);
+            }
+          } catch (err) {
+            log('内置封面重报失败', err);
+          }
+        });
+      }
     } catch (err) {
       log('上报失败', err);
     }
@@ -196,101 +352,13 @@
     try {
       const info = extract();
       if (info.title) {
-        // 专辑名保留数据线给的（网页上看不到，别用占位名覆盖）
-        writeMeta({ title: info.title, artist: info.artist, cover: info.cover, album: current.album }, false);
+        writeMeta(info);
       }
-      navigator.mediaSession.playbackState = info.playing ? 'playing' : 'paused';
+      session().playbackState = info.playing ? 'playing' : 'paused';
     } catch (err) {
       log('apply 失败', err);
     }
   }
-
-  // ⑨ feed · 数据线：抄咪咕自己打印的"当前歌曲档案"
-  // 窗口最小化时网页界面停止刷新，但咪咕仍会打印这份档案，靠它实现最小化时的实时同步
-  function parseSongArchive(raw) {
-    let obj = raw;
-    if (typeof raw === 'string') {
-      const start = raw.indexOf('{');
-      if (start < 0) {
-        return null;
-      }
-      try {
-        obj = JSON.parse(raw.slice(start));
-      } catch (err) {
-        return null;
-      }
-    }
-    const song = obj && obj.song;
-    if (!song || !song.songName) {
-      return null;
-    }
-    return {
-      id: song.id || (song.originData && song.originData.contentId) || '',
-      title: song.songName,
-      artist: song.singerName || (song.singers && song.singers[0] && song.singers[0].name) || '',
-      album: (song.album && song.album.name) || '',
-      cover: song.imgSrc || song.imgSrc1 || song.imgSrc2 || ''
-    };
-  }
-
-  function normName(s) {
-    return String(s || '').replace(/\s+/g, '');
-  }
-
-  let amberName = ''; // 每秒"播放计时"上报的歌名，判定当前曲目以它为准
-  let currentId = '';  // 计时上报里的歌曲编号，比歌名更可靠
-  let archive = null; // 最近一次歌曲档案（可能包含预取的下一首，需核对后再用）
-
-  function installFeed() {
-    ['log', 'info', 'debug'].forEach(fn => {
-      const original = console[fn];
-      if (typeof original !== 'function') {
-        return;
-      }
-      console[fn] = function () {
-        try {
-          const first = String(arguments[0] || '');
-          if (first.indexOf('media') === 0) {
-            const info = parseSongArchive(arguments[1]);
-            if (info) {
-              archive = info;
-              log('[数据线] 收到档案：', info.title, '编号：', info.id, '封面：', info.cover);
-              // 档案可能是预取的下一首：编号或歌名（忽略空格）对上才采信
-              const idMatch = currentId && info.id === currentId;
-              const nameMatch = !amberName || normName(info.title) === normName(amberName);
-              if (idMatch || nameMatch) {
-                writeMeta(info, true);
-              } else {
-                log('[数据线] 档案与当前播放不符，暂存备用');
-              }
-            }
-          } else if (first.indexOf('Amber_amberTrack') !== -1) {
-            const text = String(arguments[2] || '');
-            const matched = /"songName","EV":"([^"]+)"/.exec(text);
-            const idMatched = /"resId","EV":"([^"]+)"/.exec(text);
-            if (matched) {
-              const name = matched[1];
-              const resId = idMatched ? idMatched[1] : '';
-              if (name !== amberName || resId !== currentId) {
-                amberName = name;
-                currentId = resId;
-                log('[数据线] 计时上报切到：', name, '编号：', resId);
-                if (archive && (archive.id === resId || normName(archive.title) === normName(name))) {
-                  writeMeta(archive, true); // 档案对得上，用完整信息（歌手/专辑/封面）
-                } else {
-                  writeMeta({ title: name }, true); // 先跟上歌名，档案到了再补全
-                }
-              }
-            }
-          }
-        } catch (err) {
-          /* 抄录失败不影响任何功能 */
-        }
-        return original.apply(console, arguments);
-      };
-    });
-  }
-  installFeed();
 
   // FR-5 · 媒体键：点击播放条上对应按钮
   function clickButton(title) {
@@ -315,7 +383,7 @@
   };
   for (const [action, handler] of Object.entries(ACTIONS)) {
     try {
-      navigator.mediaSession.setActionHandler(action, handler);
+      session().setActionHandler(action, handler);
     } catch (err) {
       log('注册失败:', action, err);
     }
@@ -356,32 +424,43 @@
       characterData: true
     });
   }
-  mountObserver();
+  let pollTimer = null;
 
-  // 窗口最小化后恢复可见：立刻强制同步一次
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') {
+  function initDom() {
+    mountObserver();
+
+    // 窗口最小化后恢复可见：立刻强制同步一次
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        mountObserver();
+        syncNow();
+      }
+    });
+    window.addEventListener('focus', () => {
       mountObserver();
       syncNow();
-    }
-  });
-  window.addEventListener('focus', () => {
-    mountObserver();
-    syncNow();
-  });
+    });
 
-  const pollTimer = setInterval(() => {
+    pollTimer = setInterval(() => {
+      apply();
+    }, POLL_MS);
+
+    window.addEventListener('pagehide', () => {
+      if (observer) {
+        observer.disconnect();
+      }
+      clearInterval(pollTimer);
+    });
+
     apply();
-  }, POLL_MS);
+  }
 
-  window.addEventListener('pagehide', () => {
-    if (observer) {
-      observer.disconnect();
-    }
-    clearInterval(pollTimer);
-  });
-
-  apply();
+  // document-start 注入时网页还没内容，DOM 相关部分等网页开门后再启动
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initDom);
+  } else {
+    initDom();
+  }
 
   // ⑧ diagnose · 一键诊断（FR-8）
   function checkOne(label, selector) {
@@ -397,7 +476,7 @@
     const info = extract();
     let meta = '（无）';
     try {
-      const m = navigator.mediaSession.metadata;
+      const m = session().metadata;
       if (m) {
         meta = m.title + ' - ' + m.artist;
       }
@@ -411,7 +490,7 @@
     console.log('封面：' + checkOne('cover', SEL.cover) + '，取值：' + info.cover);
     console.log('按钮：' + checkOne('button', SEL.button) + '，播放中：' + info.playing);
     console.log('已上报给系统：' + meta);
-    console.log('数据线缓存：' + current.title + ' - ' + current.artist + '（专辑：' + current.album + '）');
+    console.log('当前缓存：' + current.title + ' - ' + current.artist);
     console.log('============================');
   }
 
