@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         咪咕音乐 SMTC 修复（Lyricify Fusion / 系统音量栏）
 // @namespace    https://github.com/bakabakbu/migu-smtc
-// @version      0.4.0
+// @version      0.4.1
 // @description  为咪咕音乐网页版补齐 Media Session 元数据，使其接入 Windows SMTC
 // @author       bakabakbu
 // @license      MIT
@@ -248,9 +248,12 @@
             const info = parseSongArchive(arguments[1]);
             if (info) {
               archive = info;
+              log('[数据线] 收到档案：', info.title, '封面：', info.cover);
               // 档案可能是预取的下一首，只有和计时上报对上（或还没有计时上报）才采信
               if (!amberName || info.title === amberName) {
                 writeMeta(info, true);
+              } else {
+                log('[数据线] 档案与当前播放不符，暂存备用');
               }
             }
           } else if (first.indexOf('Amber_amberTrack') !== -1) {
@@ -259,6 +262,7 @@
               const name = matched[1];
               if (name !== amberName) {
                 amberName = name;
+                log('[数据线] 计时上报切到：', name);
                 if (archive && archive.title === name) {
                   writeMeta(archive, true); // 档案对得上，用完整信息（歌手/专辑/封面）
                 } else {
