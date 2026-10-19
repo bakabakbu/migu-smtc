@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         咪咕音乐 SMTC 修复（Lyricify Fusion / 系统音量栏）
 // @namespace    https://github.com/bakabakbu/migu-smtc
-// @version      0.3.1
+// @version      0.3.2
 // @description  为咪咕音乐网页版补齐 Media Session 元数据，使其接入 Windows SMTC
 // @author       bakabakbu
 // @license      MIT
@@ -75,7 +75,7 @@
     cover: '.footer-player .default-cover img',
     button: '.footer-player .custom-icon'
   };
-  const THROTTLE_MS = 500;
+  const THROTTLE_MS = 300;
   const POLL_MS = 2000;
 
   // 读取配置面板的值；任何失败都保留内置默认值，绝不中断脚本
@@ -207,29 +207,35 @@
     }
   }
 
-  // ⑦ scheduler · 调度（观察器节流 + 轮询兜底 + SPA 自愈）
-  let throttleTimer = null;
+  // ⑦ scheduler · 调度（即时哨兵 + 时间戳限流 + 可见性唤醒 + 轮询兜底）
+  // 不用 setTimeout 限流：窗口最小化时定时器会被浏览器降速，导致换歌迟迟不同步
+  let lastRun = 0;
   function schedule() {
-    if (throttleTimer) {
+    const now = Date.now();
+    if (now - lastRun < THROTTLE_MS) {
       return;
     }
-    throttleTimer = setTimeout(() => {
-      throttleTimer = null;
-      apply();
-    }, THROTTLE_MS);
+    lastRun = now;
+    apply();
+  }
+
+  function syncNow() {
+    lastRun = 0;
+    apply();
   }
 
   let observer = null;
   function mountObserver() {
     if (observer) {
-      observer.disconnect();
-    }
-    const bar = document.querySelector(SEL.playerBar);
-    if (!bar) {
       return;
     }
+    const root = document.body;
+    if (!root) {
+      return;
+    }
+    // 监听整个页面：切歌时咪咕会重建播放条，只盯播放条会导致哨兵失效
     observer = new MutationObserver(schedule);
-    observer.observe(bar, {
+    observer.observe(root, {
       subtree: true,
       childList: true,
       attributes: true,
@@ -238,9 +244,20 @@
   }
   mountObserver();
 
+  // 窗口最小化后恢复可见：立刻强制同步一次
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      mountObserver();
+      syncNow();
+    }
+  });
+  window.addEventListener('focus', () => {
+    mountObserver();
+    syncNow();
+  });
+
   const pollTimer = setInterval(() => {
     apply();
-    mountObserver();
   }, POLL_MS);
 
   window.addEventListener('pagehide', () => {
