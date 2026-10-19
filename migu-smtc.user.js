@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         咪咕音乐 SMTC 修复（Lyricify Fusion / 系统音量栏）
 // @namespace    https://github.com/bakabakbu/migu-smtc
-// @version      0.3.2
+// @version      0.4.0
 // @description  为咪咕音乐网页版补齐 Media Session 元数据，使其接入 Windows SMTC
 // @author       bakabakbu
 // @license      MIT
@@ -155,28 +155,126 @@
 
   // ⑥ writer · 上报
   let lastFingerprint = '';
+  let current = { title: '', artist: '', album: '', cover: '' };
 
-  function apply() {
+  function writeMeta(info, force) {
     try {
-      const info = extract();
-      const fingerprint = [info.title, info.artist, info.cover].join('|');
-      if (fingerprint !== lastFingerprint && info.title) {
-        lastFingerprint = fingerprint;
-        navigator.mediaSession.metadata = new MediaMetadata({
-          title: info.title,
-          artist: info.artist,
-          album: '咪咕音乐',
-          artwork: info.cover
-            ? [{ src: info.cover, sizes: 'any', type: 'image/webp' }]
-            : []
-        });
-        log('已上报：', info.title, '-', info.artist);
+      const title = info.title || current.title;
+      const artist = info.artist || current.artist;
+      const album = info.album || current.album;
+      const cover = info.cover || current.cover;
+      if (!title) {
+        return;
       }
-      navigator.mediaSession.playbackState = info.playing ? 'playing' : 'paused';
+      const fingerprint = [title, artist, cover].join('|');
+      if (fingerprint === lastFingerprint) {
+        // 同一首歌不再重写，除非这次带来了之前缺的专辑名
+        if (force && album && !current.album) {
+          current.album = album;
+          navigator.mediaSession.metadata = new MediaMetadata({
+            title: title, artist: artist, album: album,
+            artwork: cover ? [{ src: cover, sizes: 'any', type: 'image/webp' }] : []
+          });
+        }
+        return;
+      }
+      lastFingerprint = fingerprint;
+      current = { title: title, artist: artist, album: album, cover: cover };
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: title,
+        artist: artist,
+        album: album || '咪咕音乐',
+        artwork: cover ? [{ src: cover, sizes: 'any', type: 'image/webp' }] : []
+      });
+      log('已上报：', title, '-', artist);
     } catch (err) {
       log('上报失败', err);
     }
   }
+
+  function apply() {
+    try {
+      const info = extract();
+      if (info.title) {
+        // 专辑名保留数据线给的（网页上看不到，别用占位名覆盖）
+        writeMeta({ title: info.title, artist: info.artist, cover: info.cover, album: current.album }, false);
+      }
+      navigator.mediaSession.playbackState = info.playing ? 'playing' : 'paused';
+    } catch (err) {
+      log('apply 失败', err);
+    }
+  }
+
+  // ⑨ feed · 数据线：抄咪咕自己打印的"当前歌曲档案"
+  // 窗口最小化时网页界面停止刷新，但咪咕仍会打印这份档案，靠它实现最小化时的实时同步
+  function parseSongArchive(raw) {
+    let obj = raw;
+    if (typeof raw === 'string') {
+      const start = raw.indexOf('{');
+      if (start < 0) {
+        return null;
+      }
+      try {
+        obj = JSON.parse(raw.slice(start));
+      } catch (err) {
+        return null;
+      }
+    }
+    const song = obj && obj.song;
+    if (!song || !song.songName) {
+      return null;
+    }
+    return {
+      title: song.songName,
+      artist: song.singerName || (song.singers && song.singers[0] && song.singers[0].name) || '',
+      album: (song.album && song.album.name) || '',
+      cover: song.imgSrc || song.imgSrc1 || song.imgSrc2 || ''
+    };
+  }
+
+  let amberName = ''; // 每秒"播放计时"上报的歌名，判定当前曲目以它为准
+  let archive = null; // 最近一次歌曲档案（可能包含预取的下一首，需核对后再用）
+
+  function installFeed() {
+    ['log', 'info', 'debug'].forEach(fn => {
+      const original = console[fn];
+      if (typeof original !== 'function') {
+        return;
+      }
+      console[fn] = function () {
+        try {
+          const first = String(arguments[0] || '');
+          if (first.indexOf('media') === 0) {
+            const info = parseSongArchive(arguments[1]);
+            if (info) {
+              archive = info;
+              // 档案可能是预取的下一首，只有和计时上报对上（或还没有计时上报）才采信
+              if (!amberName || info.title === amberName) {
+                writeMeta(info, true);
+              }
+            }
+          } else if (first.indexOf('Amber_amberTrack') !== -1) {
+            const matched = /"songName","EV":"([^"]+)"/.exec(String(arguments[2] || ''));
+            if (matched) {
+              const name = matched[1];
+              if (name !== amberName) {
+                amberName = name;
+                if (archive && archive.title === name) {
+                  writeMeta(archive, true); // 档案对得上，用完整信息（歌手/专辑/封面）
+                } else {
+                  writeMeta({ title: name }, true); // 先跟上歌名，档案到了再补全
+                }
+              }
+            }
+          }
+        } catch (err) {
+          /* 抄录失败不影响任何功能 */
+        }
+        return original.apply(console, arguments);
+      };
+    });
+  }
+  installFeed();
 
   // FR-5 · 媒体键：点击播放条上对应按钮
   function clickButton(title) {
@@ -297,6 +395,7 @@
     console.log('封面：' + checkOne('cover', SEL.cover) + '，取值：' + info.cover);
     console.log('按钮：' + checkOne('button', SEL.button) + '，播放中：' + info.playing);
     console.log('已上报给系统：' + meta);
+    console.log('数据线缓存：' + current.title + ' - ' + current.artist + '（专辑：' + current.album + '）');
     console.log('============================');
   }
 
