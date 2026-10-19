@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         咪咕音乐 SMTC 修复（Lyricify Fusion / 系统音量栏）
 // @namespace    https://github.com/bakabakbu/migu-smtc
-// @version      0.4.1
+// @version      0.4.2
 // @description  为咪咕音乐网页版补齐 Media Session 元数据，使其接入 Windows SMTC
 // @author       bakabakbu
 // @license      MIT
@@ -225,6 +225,7 @@
       return null;
     }
     return {
+      id: song.id || (song.originData && song.originData.contentId) || '',
       title: song.songName,
       artist: song.singerName || (song.singers && song.singers[0] && song.singers[0].name) || '',
       album: (song.album && song.album.name) || '',
@@ -232,7 +233,12 @@
     };
   }
 
+  function normName(s) {
+    return String(s || '').replace(/\s+/g, '');
+  }
+
   let amberName = ''; // 每秒"播放计时"上报的歌名，判定当前曲目以它为准
+  let currentId = '';  // 计时上报里的歌曲编号，比歌名更可靠
   let archive = null; // 最近一次歌曲档案（可能包含预取的下一首，需核对后再用）
 
   function installFeed() {
@@ -248,22 +254,28 @@
             const info = parseSongArchive(arguments[1]);
             if (info) {
               archive = info;
-              log('[数据线] 收到档案：', info.title, '封面：', info.cover);
-              // 档案可能是预取的下一首，只有和计时上报对上（或还没有计时上报）才采信
-              if (!amberName || info.title === amberName) {
+              log('[数据线] 收到档案：', info.title, '编号：', info.id, '封面：', info.cover);
+              // 档案可能是预取的下一首：编号或歌名（忽略空格）对上才采信
+              const idMatch = currentId && info.id === currentId;
+              const nameMatch = !amberName || normName(info.title) === normName(amberName);
+              if (idMatch || nameMatch) {
                 writeMeta(info, true);
               } else {
                 log('[数据线] 档案与当前播放不符，暂存备用');
               }
             }
           } else if (first.indexOf('Amber_amberTrack') !== -1) {
-            const matched = /"songName","EV":"([^"]+)"/.exec(String(arguments[2] || ''));
+            const text = String(arguments[2] || '');
+            const matched = /"songName","EV":"([^"]+)"/.exec(text);
+            const idMatched = /"resId","EV":"([^"]+)"/.exec(text);
             if (matched) {
               const name = matched[1];
-              if (name !== amberName) {
+              const resId = idMatched ? idMatched[1] : '';
+              if (name !== amberName || resId !== currentId) {
                 amberName = name;
-                log('[数据线] 计时上报切到：', name);
-                if (archive && archive.title === name) {
+                currentId = resId;
+                log('[数据线] 计时上报切到：', name, '编号：', resId);
+                if (archive && (archive.id === resId || normName(archive.title) === normName(name))) {
                   writeMeta(archive, true); // 档案对得上，用完整信息（歌手/专辑/封面）
                 } else {
                   writeMeta({ title: name }, true); // 先跟上歌名，档案到了再补全
