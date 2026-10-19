@@ -2,7 +2,7 @@
 
 ![版本](https://img.shields.io/badge/version-0.6.0-blue) ![平台](https://img.shields.io/badge/platform-Windows%2010%2F11-informational) ![许可](https://img.shields.io/badge/license-MIT-green)
 
-**一句话**：给咪咕音乐**网页版**补上「向 Windows 报歌曲信息」的能力，让**系统音量栏播放卡片**和 **Lyricify Fusion** 认出你正在听的歌。
+：给咪咕音乐**网页版**补上「向 Windows 报歌曲信息」的能力，让**系统音量栏播放卡片**和 **Lyricify Fusion** 认出你正在听的歌。
 
 > 咪咕网页版自己不告诉 Windows「我在放什么」，所以播放卡片是空的、歌词软件也抓不到歌。本脚本就像一个**翻译官**：把网页上的歌名、歌手、封面、播放状态抄下来，替咪咕报给 Windows。
 
